@@ -1,0 +1,24 @@
+# Environment
+.env
+
+# Vector DB (auto-rebuilds from PDF)
+chroma_db/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (students add their own PDFs)
+data/
