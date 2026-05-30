@@ -40,7 +40,9 @@ def build_index():
 
 def load_index():
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
-    return VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
+    return VectorStoreIndex.from_vector_store(
+        vector_store, storage_context=storage_context
+    )
 
 
 def get_index():
@@ -65,63 +67,99 @@ def llm(system, user):
     return res.choices[0].message.content.strip()
 
 
+# ── Agent 1: Explainer (streaming) ───────────────────────────────────────────
 
-
-# ── Agent 1: Explainer ────────────────────────────────────────────────────────
-
-def explainer(topic, context, session_history=None):
+def explainer_stream(topic, context, session_history=None):
     history_note = ""
     if session_history:
         prior = ", ".join([h["topic"] for h in session_history])
-        history_note = f"\nTopics already covered this session: {prior}. Build on these where relevant — don't repeat what was already taught."
+        history_note = (
+            f"\nTopics already covered this session: {prior}. "
+            f"Build on these where relevant — don't repeat what was already taught."
+        )
 
-    return llm(
-        system=f"""You are a sharp tutor for engineering students. No filler phrases.
+    stream = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": f"""You are a sharp tutor for engineering students. No filler phrases.
 Structure your response in exactly these sections with these headers:
 
 **Explanation**
-2-3 sentences explaining the concept clearly.
+One sentence: what it is in plain language.
+
+**Key Points**
+- Key point 1 (one line, concrete)
+- Key point 2 (one line, concrete)
+- Key point 3 (one line, concrete)
 
 **Analogy**
-One real-world analogy in 1-2 sentences.
+One sentence real-world analogy.
 
 **Example**
-A short, self-contained code example with inline comments.
-Pick a concrete input (e.g. factorial(4), not factorial(n)) so it can be traced.
+Self-contained Python code, MAX 12 lines.
+- Use concrete values (e.g. factorial(4) not factorial(n))
+- No imports — pure Python only
+- 1-2 inline comments on key lines
 
-**Check**
-One open-ended question to test understanding.
-Accept pseudocode or informal answers — the idea matters, not perfect syntax.{history_note}""",
-        user=f"Textbook context:\n---\n{context}\n---\nExplain: \"{topic}\"",
+"""
+            },
+            {
+                "role": "user",
+                "content": f"Textbook context:\n---\n{context}\n---\nExplain: \"{topic}\"",
+            },
+        ],
+        stream=True,
     )
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
 
 
-# ── Agent 2: Trace generator ──────────────────────────────────────────────────
+# ── Agent 2: Follow-up responder (streaming) ──────────────────────────────────
 
-def trace_generator(topic, code, context):
-    """Generates a step-by-step execution trace for the code example."""
-    raw = llm(
-        system="""You generate step-by-step execution traces for code examples.
-Return ONLY valid JSON, no extra text:
-[
-  {"step": 1, "call": "factorial(4)", "what_happens": "n=4, not base case, will recurse", "value": null},
-  {"step": 2, "call": "factorial(3)", "what_happens": "n=3, not base case, will recurse", "value": null},
-  {"step": 3, "call": "factorial(0)", "what_happens": "base case hit, returns 1", "value": 1},
-  {"step": 4, "call": "unwinding", "what_happens": "1 * 1 = 1, returns to factorial(1)", "value": 1},
-  {"step": 5, "call": "unwinding", "what_happens": "2 * 1 = 2, returns to factorial(2)", "value": 2}
-]
-Rules:
-- Max 8 steps
-- Use the actual concrete values from the code (e.g. factorial(4), not factorial(n))
-- Make each step one clear sentence
-- Show unwinding/return steps for recursive functions
-- For loops, show first 2-3 iterations then skip to result""",
-        user=f"Topic: {topic}\nCode to trace:\n```python\n{code}\n```\nGenerate the execution trace.",
+def follow_up_stream(topic, question, context, conversation_history=None, session_history=None):
+    history_str = ""
+    if conversation_history:
+        for msg in conversation_history:
+            role = "Student" if msg["role"] == "user" else "Tutor"
+            history_str += f"{role}: {msg['content']}\n"
+
+    session_note = ""
+    if session_history:
+        prior = ", ".join([h["topic"] for h in session_history])
+        session_note = f"\nTopics already covered: {prior}."
+
+    stream = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": f"""You are a sharp tutor for engineering students. No filler phrases.
+The student is learning: "{topic}"
+- Answer in 2-4 short sentences or bullet points
+- If listing multiple things, use bullet points
+- If they ask about a prerequisite, explain briefly then connect back to {topic}
+- If they ask an unrelated topic, say: "That's separate — let's finish {topic} first"
+- Pure Python only if showing code, under 10 lines, concrete values only{session_note}""",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Context:\n---\n{context}\n---\n"
+                    f"Conversation:\n{history_str}"
+                    f"Question: {question}"
+                ),
+            },
+        ],
+        stream=True,
     )
-    try:
-        return json.loads(raw.replace("```json", "").replace("```", "").strip())
-    except:
-        return None
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
 
 
 # ── Agent 3: Assessor ─────────────────────────────────────────────────────────
@@ -134,27 +172,34 @@ def assessor(topic, explanation, student_answer, session_history=None):
 
     raw = llm(
         system=f"""You assess whether an engineering student understood a concept.
-Be LENIENT about syntax and format — pseudocode, informal language, and incomplete
-sentences are fine as long as the core idea is correct.
+Be LENIENT about syntax — pseudocode and informal language are fine if the idea is correct.
+If the student's answer shows they understand the concept, score it 4 or 5.
+Do not penalise for not writing perfect code.
 
-IMPORTANT: If the student's answer shows they understand the concept — even if
-phrased informally — score it 4 or 5. Don't penalise for not writing perfect code.
-
-Return ONLY valid JSON:
+Return ONLY valid JSON, no extra text:
 {{"score": <1-5>, "verdict": "<UNDERSTOOD|PARTIAL|CONFUSED>", "feedback": "<one sentence>"}}
 
 Scoring:
   5 = correct idea, well explained
-  4 = correct idea, minor gaps or informal phrasing (this is fine)
+  4 = correct idea, minor gaps or informal phrasing
   3 = partially right, missing one key piece
   2 = has some awareness but a real misconception
   1 = wrong or completely off{history_note}""",
-        user=f"Topic: {topic}\nExplanation given: {explanation}\nStudent's answer: {student_answer}\nReturn JSON only.",
+        user=(
+            f"Topic: {topic}\n"
+            f"Explanation given: {explanation}\n"
+            f"Student's answer: {student_answer}\n"
+            f"Return JSON only."
+        ),
     )
     try:
         return json.loads(raw.replace("```json", "").replace("```", "").strip())
     except:
-        return {"score": 3, "verdict": "PARTIAL", "feedback": "Keep going, you're on the right track."}
+        return {
+            "score": 3,
+            "verdict": "PARTIAL",
+            "feedback": "Keep going, you're on the right track.",
+        }
 
 
 # ── Agent 4: Reexplainer ──────────────────────────────────────────────────────
@@ -163,14 +208,19 @@ def reexplainer(topic, context, focus="the concept", session_history=None):
     history_note = ""
     if session_history:
         prior = ", ".join([h["topic"] for h in session_history])
-        history_note = f"\nThe student already understands: {prior}. Use these to build bridges."
+        history_note = f"\nStudent already understands: {prior}. Use these to build bridges."
 
     return llm(
-        system=f"""You are a patient tutor. A student didn't understand something.
-Re-explain from scratch — simpler, shorter, different angle than the first explanation.
+        system=f"""You are a patient tutor. Re-explain from scratch — simpler, shorter, different angle.
 No code unless the focus is syntax. Build intuition first.
-3-4 sentences max. End with one very simple check question.{history_note}""",
-        user=f"Topic: {topic}\nStudent is stuck on: {focus}\nContext:\n---\n{context}\n---\nRe-explain simply.",
+Use bullet points if helpful. 3-4 sentences or points max.
+End with one simple check question.{history_note}""",
+        user=(
+            f"Topic: {topic}\n"
+            f"Stuck on: {focus}\n"
+            f"Context:\n---\n{context}\n---\n"
+            f"Re-explain simply."
+        ),
     )
 
 
@@ -178,25 +228,28 @@ No code unless the focus is syntax. Build intuition first.
 
 def quiz_generator(topic, context, difficulty=1):
     difficulty_instructions = {
-        1: "Basic recall. ALL questions must directly test the concept of '{topic}'. Ask about its definition, purpose, or behaviour.",
-        2: "Application. ALL questions must test how to USE '{topic}' correctly, including edge cases specific to '{topic}'.",
-        3: "Analysis. ALL questions must present tricky scenarios about '{topic}' — what breaks, what's surprising, comparison with similar concepts.",
+        1: "Basic recall. Test if they know what the concept is and its purpose.",
+        2: "Application. Test if they can use it correctly including simple edge cases.",
+        3: "Analysis. Tricky edge cases, comparison with similar concepts, what breaks and why.",
     }
-    diff_text = difficulty_instructions[difficulty].replace("{topic}", topic)
-
     raw = llm(
         system=f"""You write MCQ questions for engineering students.
 
-CRITICAL RULE: Every single question MUST be directly about the topic: "{topic}".
+CRITICAL RULE: Every single question MUST be directly about "{topic}".
 Do NOT write general Python questions. Do NOT ask about unrelated data structures or syntax.
-If the topic is "stack", ALL questions must be about stacks — LIFO behaviour, push/pop, use cases.
-If the topic is "recursion", ALL questions must be about recursion — base cases, call stack, etc.
+If the topic is "stack", ALL questions must be about stacks — LIFO, push/pop, use cases, errors.
+If the topic is "recursion", ALL questions must be about recursion — base case, call stack, etc.
 Wrong answers must reflect REAL misconceptions students have about "{topic}" specifically.
 Never make one option clearly longer or better formatted than others.
 
 Return ONLY valid JSON, no markdown, no extra text:
 [{{"question":"...","options":{{"A":"...","B":"...","C":"...","D":"..."}},"answer":"B","explanation":"one sentence why"}}]""",
-        user=f"Topic: {topic}\nDifficulty: {difficulty}/3 — {diff_text}\nContext:\n---\n{context}\n---\nWrite exactly 3 MCQs. EVERY question must be about \"{topic}\". Return only JSON.",
+        user=(
+            f"Topic: {topic}\n"
+            f"Difficulty: {difficulty}/3 — {difficulty_instructions[difficulty]}\n"
+            f"Context:\n---\n{context}\n---\n"
+            f"Write exactly 3 MCQs. Every question must be about \"{topic}\". Return only JSON."
+        ),
     )
     try:
         return json.loads(raw.replace("```json", "").replace("```", "").strip())
